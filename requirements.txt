@@ -1,0 +1,6 @@
+numpy
+Pillow
+piexif
+scipy
+torch
+torchvision
