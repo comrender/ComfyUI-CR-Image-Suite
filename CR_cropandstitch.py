@@ -1152,28 +1152,31 @@ class CR_InpaintCropImproved:
                 "image": ("IMAGE",),
                 "mask": ("MASK",),
                 "padding_pixels": ("INT", {"default": 32, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),
+                "mask_threshold": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 1.0, "step": 0.01}),
             }
         }
 
     FUNCTION = "inpaint_crop"
     CATEGORY = "CR Image Suite/Inpaint"
-    DESCRIPTION = "Crops an image around a mask into a square region with configurable pixel padding."
+    DESCRIPTION = "Crops an image around a thresholded mask into a square region with configurable pixel padding."
     RETURN_TYPES = ("STITCHER", "IMAGE", "MASK")
     RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask")
  
-    def _build_square_bbox(self, x, y, w, h, padding_pixels):
+    def _build_square_bbox(self, x, y, w, h, padding_pixels, min_side=None):
         padded_x = x - padding_pixels
         padded_y = y - padding_pixels
         padded_w = w + (padding_pixels * 2)
         padded_h = h + (padding_pixels * 2)
         side = max(1, padded_w, padded_h)
+        if min_side is not None:
+            side = max(side, int(min_side))
         center_x = padded_x + (padded_w / 2.0)
         center_y = padded_y + (padded_h / 2.0)
         square_x = int(math.floor(center_x - (side / 2.0)))
         square_y = int(math.floor(center_y - (side / 2.0)))
         return square_x, square_y, side
 
-    def inpaint_crop(self, image, mask, padding_pixels):
+    def inpaint_crop(self, image, mask, padding_pixels, mask_threshold=0.5):
         image = image.clone()
         mask = mask.clone()
         processor = CPUProcessorLogic()
@@ -1193,9 +1196,27 @@ class CR_InpaintCropImproved:
         assert mask.shape[1:] == image.shape[1:3], f"Mask dimensions do not match image dimensions. Expected {image.shape[1:3]}, got {mask.shape[1:]}"
         assert mask.shape[0] == image.shape[0], f"Mask batch does not match image batch. Expected {image.shape[0]}, got {mask.shape[0]}"
 
+        detection_mask = (mask >= mask_threshold).to(mask.dtype)
+        crop_regions = []
+        max_square_side = 1
+
+        for i in range(image.shape[0]):
+            sub_image = image[i:i+1]
+            sub_detection_mask = detection_mask[i:i+1]
+            _, bx, by, bw, bh = processor.batched_findcontextarea_m(sub_detection_mask)
+
+            if bx[0] == -1:
+                x, y, w, h = 0, 0, sub_image.shape[2], sub_image.shape[1]
+            else:
+                x, y, w, h = bx[0].item(), by[0].item(), bw[0].item(), bh[0].item()
+
+            _, _, square_side = self._build_square_bbox(x, y, w, h, int(padding_pixels))
+            max_square_side = max(max_square_side, square_side)
+            crop_regions.append((x, y, w, h))
+
         result_stitcher = {
-            'downscale_algorithm': 'bilinear',
-            'upscale_algorithm': 'bicubic',
+            'downscale_algorithm': 'lanczos',
+            'upscale_algorithm': 'lanczos',
             'blend_pixels': 0,
             'canvas_to_orig_x': [],
             'canvas_to_orig_y': [],
@@ -1211,17 +1232,18 @@ class CR_InpaintCropImproved:
         result_image = []
         result_mask = []
 
-        for i in range(image.shape[0]):
+        for i, (x, y, w, h) in enumerate(crop_regions):
             sub_image = image[i:i+1]
             sub_mask = mask[i:i+1]
-            _, bx, by, bw, bh = processor.batched_findcontextarea_m(sub_mask)
 
-            if bx[0] == -1:
-                x, y, w, h = 0, 0, sub_image.shape[2], sub_image.shape[1]
-            else:
-                x, y, w, h = bx[0].item(), by[0].item(), bw[0].item(), bh[0].item()
-
-            square_x, square_y, square_side = self._build_square_bbox(x, y, w, h, int(padding_pixels))
+            square_x, square_y, square_side = self._build_square_bbox(
+                x,
+                y,
+                w,
+                h,
+                int(padding_pixels),
+                min_side=max_square_side,
+            )
 
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = processor.crop_magic_im(
                 sub_image,
@@ -1264,6 +1286,7 @@ class CR_InpaintStitchImproved:
             "required": {
                 "stitcher": ("STITCHER",),
                 "inpainted_image": ("IMAGE",),
+                "sampling": (["lanczos", "bicubic", "bilinear", "nearest"], {"default": "lanczos"}),
             }
         }
 
@@ -1276,7 +1299,7 @@ class CR_InpaintStitchImproved:
     FUNCTION = "inpaint_stitch"
 
 
-    def inpaint_stitch(self, stitcher, inpainted_image):
+    def inpaint_stitch(self, stitcher, inpainted_image, sampling="lanczos"):
         inpainted_image = inpainted_image.clone()
         results = []
         device = torch.device("cpu")
@@ -1305,7 +1328,7 @@ class CR_InpaintStitchImproved:
                 else:
                     one_stitcher[key] = stitcher[key][i]
 
-            one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image, processor)
+            one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image, processor, sampling)
             results.append(one_image.squeeze(0))
 
         result_batch = torch.stack(results, dim=0)
@@ -1313,9 +1336,8 @@ class CR_InpaintStitchImproved:
 
         return (result_batch,)
 
-    def inpaint_stitch_single_image(self, stitcher, inpainted_image, processor):
-        downscale_algorithm = stitcher.get('downscale_algorithm', 'bilinear')
-        upscale_algorithm = stitcher.get('upscale_algorithm', 'bicubic')
+    def inpaint_stitch_single_image(self, stitcher, inpainted_image, processor, sampling="lanczos"):
+        sampling = sampling.lower()
         canvas_image = stitcher['canvas_image']
 
         ctc_x = stitcher['cropped_to_canvas_x']
@@ -1330,7 +1352,7 @@ class CR_InpaintStitchImproved:
 
         mask = stitcher['cropped_mask_for_blend']  # shape: [1, H, W]
 
-        output_image = processor.stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm)
+        output_image = processor.stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, sampling, sampling)
 
         return (output_image,)
 
