@@ -501,6 +501,46 @@ class CR_Mask_Combine:
         return (combined_mask,)
 
 
+class CR_Convert_Mask_To_Bounding_Box:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "padding": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+            },
+        }
+
+    CATEGORY = "CR Image Suite/Mask"
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "convert_mask_to_bounding_box"
+
+    def convert_mask_to_bounding_box(self, mask, padding):
+        is_single_mask = mask.dim() == 2
+        masks = mask.unsqueeze(0) if is_single_mask else mask
+        output = torch.zeros_like(masks)
+
+        for i in range(len(masks)):
+            current_mask = masks[i]
+            rows = torch.any(current_mask > 0, dim=1)
+            cols = torch.any(current_mask > 0, dim=0)
+
+            if not torch.any(rows) or not torch.any(cols):
+                continue
+
+            row_idx = torch.where(rows)[0]
+            col_idx = torch.where(cols)[0]
+            rmin = max(int(row_idx[0].item()) - padding, 0)
+            rmax = min(int(row_idx[-1].item()) + padding, current_mask.shape[0] - 1)
+            cmin = max(int(col_idx[0].item()) - padding, 0)
+            cmax = min(int(col_idx[-1].item()) + padding, current_mask.shape[1] - 1)
+
+            output[i, rmin : rmax + 1, cmin : cmax + 1] = 1.0
+
+        return (output.squeeze(0) if is_single_mask else output,)
+
+
 class CR_Grow_Mask:
     @classmethod
     def INPUT_TYPES(cls):
@@ -721,6 +761,7 @@ class CR_Image_Mask_Switch:
 
 NODE_CLASS_MAPPINGS = {
     "CR Advanced Load": CR_Advanced_Load,
+    "CR Convert Mask to Bounding Box": CR_Convert_Mask_To_Bounding_Box,
     "CR Image Crop by Mask": CR_Image_Crop_By_Mask,
     "CR Image Save": CR_Image_Save,
     "CR Mask Combine": CR_Mask_Combine,
@@ -733,6 +774,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CR Advanced Load": "CR Advanced Load",
+    "CR Convert Mask to Bounding Box": "Convert Mask to Bounding Box",
     "CR Image Crop by Mask": "CR Image Crop by Mask",
     "CR Image Save": "CR Image Save",
     "CR Mask Combine": "CR Mask Combine",
